@@ -71,17 +71,49 @@ function Get-Architecture()
     return "Unknown"
 }
 
+function Find-VisualStudioTools(){
+    # A hardcoded "...\2022\<Edition>\..." path breaks every time Microsoft renumbers the
+    # product (GitHub Actions' windows-latest moved to VS 2026, installed under "\18\", in June
+    # 2026 -- with no VS-version string anywhere in this repo's own workflow to warn you). Use
+    # vswhere.exe instead: it has shipped with every VS installer since 2017 specifically so
+    # scripts never have to know a version number, per Microsoft's own guidance:
+    # https://learn.microsoft.com/en-us/visualstudio/install/tools-for-managing-visual-studio-instances
+    $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path -Path $vswhere) {
+        $installPath = & $vswhere -latest -prerelease -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+        if ($installPath) {
+            $candidate = Join-Path $installPath "Common7\Tools"
+            if (Test-Path -Path $candidate) {
+                return $candidate
+            }
+        }
+    }
+
+    # vswhere missing or found nothing with the C++ workload -- fall back to the last few
+    # concrete layouts actually seen on GitHub-hosted runners, newest first.
+    foreach ($guess in @(
+        "C:\Program Files\Microsoft Visual Studio\18\Enterprise\Common7\Tools",
+        "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools",
+        "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools"
+    )) {
+        if (Test-Path -Path $guess) {
+            return $guess
+        }
+    }
+
+    return $null
+}
+
 function Set-BuildEnvironment(){
     if("windows" -eq $(Get-OS)){
-        #https://stackoverflow.com/a/64744522
-        $location = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools"
-        if (!(Test-Path -Path $location)) {
-            $location = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools"
-        }
-        if (!(Test-Path -Path $location)) {
-            Write-Error "MSVC was not found"
+        $location = Find-VisualStudioTools
+        if (!$location) {
+            Write-Error "MSVC was not found (checked vswhere.exe and known install paths)"
             exit 1
         }
+        Write-Host "Using Visual Studio tools at: $location"
         Push-Location $location
         cmd /c "VsDevCmd.bat -arch=amd64 -host_arch=amd64&set " |
         ForEach-Object {
