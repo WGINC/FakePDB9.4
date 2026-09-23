@@ -18,6 +18,8 @@
 import os
 
 import ida_kernwin
+
+from . import ui
 import ida_nalt
 
 from .offsets_importer import OffsetsImporter
@@ -26,7 +28,7 @@ from .offsets_importer import OffsetsImporter
 # Menu handler
 #
 
-class __fakepdb_offsetsimport_actionhandler(ida_kernwin.action_handler_t):
+class _FakepdbOffsetsimportActionhandler(ida_kernwin.action_handler_t):
     def __init__(self):
         ida_kernwin.action_handler_t.__init__(self)
 
@@ -55,13 +57,4 @@ class __fakepdb_offsetsimport_actionhandler(ida_kernwin.action_handler_t):
         return ida_kernwin.AST_ENABLE_FOR_IDB
     
 def register_actions():
-    action_desc = ida_kernwin.action_desc_t(
-        'fakepdb_offsets_import',                # The action name. This acts like an ID and must be unique
-        'Import offsets from .json',             # The action text.
-        __fakepdb_offsetsimport_actionhandler(), # The action handler.
-        'Ctrl+Shift+3',                          # Optional: the action shortcut
-        '',                                      # Optional: the action tooltip (available in menus/toolbar)
-        0)                                       # Optional: the action icon (shows when in menus/toolbars)
-
-    ida_kernwin.register_action(action_desc)
-    ida_kernwin.attach_action_to_menu('Edit/FakePDB/', 'fakepdb_offsets_import', ida_kernwin.SETMENU_APP)
+    ui.register('fakepdb_offsets_import', 'Import offsets from .json', _FakepdbOffsetsimportActionhandler(), 'Ctrl+Shift+3')

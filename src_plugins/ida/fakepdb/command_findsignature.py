@@ -15,6 +15,8 @@
 """
 
 import ida_kernwin
+
+from . import ui
 import ida_nalt
 import ida_name
 
@@ -24,7 +26,7 @@ from .signature_finder import SignatureFinder
 # Menu handler
 #
 
-class __fakepdb_findsig_actionhandler(ida_kernwin.action_handler_t):
+class _FakepdbFindsigActionhandler(ida_kernwin.action_handler_t):
     def __init__(self):
         ida_kernwin.action_handler_t.__init__(self)
 
@@ -50,13 +52,4 @@ class __fakepdb_findsig_actionhandler(ida_kernwin.action_handler_t):
         return ida_kernwin.AST_ENABLE_FOR_IDB
     
 def register_actions():
-    action_desc = ida_kernwin.action_desc_t(
-        'fakepdb_signatures_find',         # The action name. This acts like an ID and must be unique
-        'Find signature',                  # The action text.
-        __fakepdb_findsig_actionhandler(), # The action handler.
-        'Ctrl+Shift+2',                    # Optional: the action shortcut
-        '',                                # Optional: the action tooltip (available in menus/toolbar)
-        0)                                 # Optional: the action icon (shows when in menus/toolbars)
-
-    ida_kernwin.register_action(action_desc)
-    ida_kernwin.attach_action_to_menu('Edit/FakePDB/', 'fakepdb_signatures_find', ida_kernwin.SETMENU_APP)
+    ui.register('fakepdb_signatures_find', 'Find signature', _FakepdbFindsigActionhandler(), 'Ctrl+Shift+2')

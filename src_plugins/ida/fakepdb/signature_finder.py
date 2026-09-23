@@ -16,13 +16,14 @@
 """
 
 
-import ida_pro
 import ida_bytes
 import ida_ida
 import ida_idaapi
 import ida_nalt
 import ida_ua
 import ida_xref
+
+from . import compat
 
 
 class SignatureFinder:
@@ -92,19 +93,14 @@ class SignatureFinder:
     def __search_resultcount(self, signature): 
         search_results = 0
      
-        if ida_pro.IDA_SDK_VERSION >= 900:
-            addr_start = ida_ida.inf_get_min_ea()
-            addr_stop = ida_ida.inf_get_max_ea()
-        else:
-            addr_start = ida_ida.cvar.inf.min_ea
-            addr_stop = ida_ida.cvar.inf.max_ea
+        addr_start = compat.min_ea()
+        addr_stop = compat.max_ea()
 
-    
         while search_results < 2:
             search_pattern = ida_bytes.compiled_binpat_vec_t()
             ida_bytes.parse_binpat_str(search_pattern, addr_start, signature, 16, ida_nalt.get_default_encoding_idx(ida_nalt.BPU_1B))
    
-            addr_start = ida_bytes.bin_search(addr_start, addr_stop, search_pattern, ida_bytes.BIN_SEARCH_CASE)[0]
+            addr_start = compat.bin_search(addr_start, addr_stop, search_pattern, ida_bytes.BIN_SEARCH_CASE)
             if addr_start == ida_idaapi.BADADDR:
                 break
             addr_start = addr_start + 1
@@ -120,7 +116,7 @@ class SignatureFinder:
         return False
 
     def __inst_value_offset(self, instruction):
-        for i in range(0, ida_ida.UA_MAXOP):
+        for i in range(0, compat.ua_maxop()):
             if instruction.ops[i].offb != 0:
                 return instruction.ops[i].offb
 

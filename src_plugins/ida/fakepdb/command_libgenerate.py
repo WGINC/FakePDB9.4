@@ -15,73 +15,58 @@
 """
 
 '''
-generates PDB from the IDA database
+generates LIB from the IDA database
 '''
 
 import os
 
-import ida_auto
 import ida_kernwin
-import ida_loader
-import ida_nalt
 
+from . import ui
 from .dumpinfo import DumpInfo
-from .native import Native
+from .native import Native, NativeError
 
-#
-# Menu handler
-#
 
-class __fakepdb_libgeneration_actionhandler(ida_kernwin.action_handler_t):
+class _LibGenerationHandler(ida_kernwin.action_handler_t):
     def __init__(self):
         ida_kernwin.action_handler_t.__init__(self)
 
-    # Say hello when invoked.
     def activate(self, ctx):
-        # get active filename
-        pe_filename_ext = ida_nalt.get_root_filename()
-        if not pe_filename_ext:
+        name_ext, name = ui.input_names()
+        if not name_ext:
             print('FakePDB/generate lib: file not loaded')
             return 1
 
-        ida_auto.set_ida_state(ida_auto.st_Work)
         print('FakePDB/generate lib:')
+        idb_dir = ui.idb_dir()
+        filepath_json = os.path.join(idb_dir, name_ext + '.json')
+        filepath_lib  = os.path.join(idb_dir, name + '.lib')
 
         dumper = DumpInfo()
-        native = Native()
+        try:
+            with ui.busy():
+                print('    * generating JSON: %s' % filepath_json)
+                dumper.dump_info(filepath_json, include_types=False)
+                ui.print_warnings(dumper)
 
-        #calculate locations
-        idb_dir = os.path.dirname(ida_loader.get_path(ida_loader.PATH_TYPE_IDB))
-        
-        pe_filename, _ = os.path.splitext(ida_nalt.get_root_filename())
+                if os.path.exists(filepath_lib):
+                    os.remove(filepath_lib)
+                print('    * generating LIB: %s' % filepath_lib)
+                Native().coff_createlib(filepath_json, filepath_lib)
 
-        filepath_exe  = ida_nalt.get_input_file_path()
-        filepath_json = os.path.join(idb_dir, pe_filename_ext + ".json")
-        filepath_lib  = os.path.join(idb_dir, pe_filename + ".lib")
-
-        #generate json       
-        print('    * generating JSON: %s' % filepath_json)
-        dumper.dump_info(filepath_json)
-
-        print('    * generating LIB: %s' % filepath_lib)
-        native.coff_createlib(filepath_json, filepath_lib)
-
-        print('    * done')
-
-        ida_auto.set_ida_state(ida_auto.st_Ready)
+            if not os.path.exists(filepath_lib):
+                print('    * FAILED: the native tool exited cleanly but wrote no LIB')
+            else:
+                print('    * done')
+        except NativeError as e:
+            print('    * FAILED: %s' % e)
+        except Exception as e:
+            print('    * FAILED: %s: %s' % (type(e).__name__, e))
         return 1
 
     def update(self, ctx):
         return ida_kernwin.AST_ENABLE_FOR_IDB
-    
-def register_actions():
-    action_desc = ida_kernwin.action_desc_t(
-        'fakepdb_lib_generation',                # The action name. This acts like an ID and must be unique
-        'Generate .LIB file',                    # The action text.
-        __fakepdb_libgeneration_actionhandler(), # The action handler.
-        'Ctrl+Shift+6',                          # Optional: the action shortcut
-        '',                                      # Optional: the action tooltip (available in menus/toolbar)
-        0)                                       # Optional: the action icon (shows when in menus/toolbars)
 
-    ida_kernwin.register_action(action_desc)
-    ida_kernwin.attach_action_to_menu('Edit/FakePDB/', 'fakepdb_lib_generation', ida_kernwin.SETMENU_APP)
+
+def register_actions():
+    ui.register('fakepdb_lib_generation', 'Generate .LIB file', _LibGenerationHandler(), 'Ctrl+Shift+6')

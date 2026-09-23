@@ -12,285 +12,128 @@
    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
    See the License for the specific language governing permissions and
    limitations under the License.
+
+   IDA 9.x port: every string the native tools require is guaranteed non-null, the 9.0 local-types
+   count bug is fixed, PE/CodeView info no longer depends on 32-bit-only header offsets, and every
+   best-effort section (type info, calling conventions, local types) is isolated so one odd entry
+   can no longer abort the whole export.
 """
 
-from __future__ import print_function
-
 import json
+import os
 import struct
 import sys
 
-import ida_pro
 import ida_bytes
 import ida_entry
 import ida_funcs
-import ida_ida
 import ida_idaapi
 import ida_nalt
 import ida_name
 import ida_netnode
 import ida_segment
 import ida_typeinf
-if ida_pro.IDA_SDK_VERSION < 900:
-    import ida_struct
+
+try:
+    import ida_struct          # removed in IDA 9.0 (merged into ida_typeinf)
+except ImportError:
+    ida_struct = None
+
+from . import compat
+
+
+RVA_LIMIT = 2 ** 32
 
 
 #
-# PE
+# PE information
 #
 
-class PE_Struct(object):
+def _read_pe_from_file(path):
+    '''
+    Header fields and the CodeView (RSDS) record, straight from the input file on disk.
+    Handles PE32 and PE32+ (the IDA netnode layout upstream relied on is only correct for PE32).
+    Returns None if the file is missing or unreadable.
+    '''
+    try:
+        with open(path, 'rb') as f:
+            data = f.read()
+    except (OSError, TypeError):
+        return None
 
-    def __init__(self, packinfo, data):
-        (format, names) = PE_Struct.parse(packinfo)
-        self.data = self.__unpack(data, format, names)
-
-    def __unpack(self, array, format, names):
-        unpack_list = {}
-
-        unpack_tuple = struct.unpack(format, array[0:struct.calcsize(format)])
-        for pair in zip(names, unpack_tuple):
-            unpack_list[pair[0]] = pair[1]
-
-        return unpack_list
-
-    def show(self):
-        for k, v in self.data.items(): 
-            if isinstance(v, str):
-                print("{:32} {}".format(k, v))
-            else:
-                print("{:32} {}".format(k, hex(v)))
-        print('')
-
-    def parse(packinfo):
-        unpack_format = ''
-        unpack_names = list()
-
-        for pair in packinfo:
-            unpack_format += pair[0]
-            unpack_names.append(pair[1])
-
-        return (unpack_format, unpack_names)
-
-
-class PE_Header_IDA(PE_Struct):
-    packinfo = [
-        ['i', 'signature'],
-        ['H', 'machine'],
-        ['H', 'nobjs'],
-        ['I', 'datetime'],
-        ['I', 'symtof'],
-        ['I', 'nsyms'],
-        ['H', 'hdrsize'],
-        ['H', 'flags'],
-        ['H', 'magic'],
-        ['B', 'vstamp_major'],
-        ['B', 'vstamp_minor'],
-        ['I', 'tsize'],
-        ['I', 'dsize'],
-        ['I', 'bsize'],
-        ['I', 'entry'],
-        ['I', 'text_start'],
-        ['I', 'data_start'],
-        ['I', 'imagebase32'],
-        ['I', 'objalign'],
-        ['I', 'filealign'],
-        ['H', 'osmajor'],
-        ['H', 'osminor'],
-        ['H', 'imagemajor'],
-        ['H', 'imageminor'],
-        ['H', 'subsysmajor'],
-        ['H', 'subsysminor'],
-        ['I', 'reserved'],
-        ['I', 'imagesize'],
-        ['I', 'allhdrsize'],
-        ['I', 'checksum'],
-        ['H', 'subsys'],
-        ['H', 'dllflags'],
-        ['I', 'stackres'],
-        ['I', 'stackcom'],
-        ['I', 'heapres'],
-        ['I', 'heapcom'],
-        ['I', 'loaderflags'],
-        ['I', 'nrvas'],
-        ['I', 'expdir_rva'],
-        ['I', 'expdir_size'],
-        ['I', 'impdir_rva'],
-        ['I', 'impdir_size'],
-        ['I', 'resdir_rva'],
-        ['I', 'resdir_size'],
-        ['I', 'excdir_rva'],
-        ['I', 'excdir_size'],
-        ['I', 'secdir_rva'],
-        ['I', 'secdir_size'],
-        ['I', 'reltab_rva'],
-        ['I', 'reltab_size'],
-        ['I', 'debdir_rva'],
-        ['I', 'debdir_size'],
-        ['I', 'desstr_rva'],
-        ['I', 'desstr_size'],
-        ['I', 'cputab_rva'],
-        ['I', 'cputab_size'],
-        ['I', 'tlsdir_rva'],
-        ['I', 'tlsdir_size'],
-        ['I', 'loddir_rva'],
-        ['I', 'loddir_size'],
-        ['I', 'bimtab_rva'],
-        ['I', 'bimtab_size'],
-        ['I', 'iat_rva'],
-        ['I', 'iat_size'],
-        ['I', 'didtab_rva'],
-        ['I', 'didtab_size'],
-        ['I', 'comhdr_rva'],
-        ['I', 'comhdr_size'],
-        ['I', 'x00tab_rva'],
-        ['I', 'x00tab_size'],
-    ]
-
-    def __init__(self):
-        node = ida_netnode.netnode()
-        node.create("$ PE header")
-        
-        super().__init__(PE_Header_IDA.packinfo, node.valobj())
-
-        self.__describe_pe_signature()
-        self.__describe_pe_magic()
-
-    def get_imagebase(self):
-        if self.data['signature'] == 'pe32+':
-            return self.data['imagebase64']
-        
-        return self.data['imagebase32']
-
-    def get_sections_debug(self):
-        sec_rva = self.data['debdir_rva']
-        sec_len = self.data['debdir_size']
-
-        if sec_rva == 0 or sec_len == 0:
+    try:
+        if data[:2] != b'MZ':
+            return None
+        e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
+        if data[e_lfanew:e_lfanew + 4] != b'PE\0\0':
             return None
 
-        sec_size = PE_Directory_Debug.get_section_size()
-        sec_count = sec_len // sec_size
+        coff = e_lfanew + 4
+        machine, nsections, datetime = struct.unpack_from('<HHI', data, coff)
+        opt_size = struct.unpack_from('<H', data, coff + 16)[0]
+        opt = coff + 20
+        magic = struct.unpack_from('<H', data, opt)[0]
+        image_size = struct.unpack_from('<I', data, opt + 56)[0]
+        datadir = opt + (96 if magic == 0x10B else 112)
+        debug_rva, debug_size = struct.unpack_from('<II', data, datadir + 6 * 8)
 
-        result = list()
-        for i in range(0, sec_count):
-            result.append(PE_Directory_Debug(self.get_imagebase(), sec_rva + i*sec_size, sec_size))
-        
+        result = {
+            'image_datetime': datetime,
+            'image_machine': machine,
+            'image_size': image_size,
+            'pdb_age': 0,
+            'pdb_guid': [0] * 16,
+        }
+
+        # section table, to turn the debug directory RVA into a file offset
+        sections = []
+        sect = opt + opt_size
+        for i in range(nsections):
+            vsize, va, rawsize, rawptr = struct.unpack_from('<IIII', data, sect + i * 40 + 8)
+            sections.append((va, max(vsize, rawsize), rawptr))
+
+        def rva_to_off(rva):
+            for va, size, rawptr in sections:
+                if va <= rva < va + size:
+                    return rva - va + rawptr
+            return None
+
+        off = rva_to_off(debug_rva) if debug_rva else None
+        if off is not None:
+            for i in range(debug_size // 28):
+                (_, _, _, _, dbg_type, dbg_size, _, dbg_ptr) = \
+                    struct.unpack_from('<IIHHIIII', data, off + i * 28)
+                if dbg_type != 2 or dbg_ptr + 24 > len(data):
+                    continue
+                # Only trust a real RSDS record. Packed/protected binaries (FFXiMain.dll is one)
+                # can carry a CodeView entry whose data was overwritten by the packer.
+                if data[dbg_ptr:dbg_ptr + 4] == b'RSDS':
+                    result['pdb_guid'] = list(data[dbg_ptr + 4:dbg_ptr + 20])
+                    result['pdb_age'] = struct.unpack_from('<I', data, dbg_ptr + 20)[0]
+                break
+
         return result
-        
-
-    def __describe_pe_signature(self):
-        val = self.data['signature']
-        if val == 0x4550:
-            val = 'pe'
-        if val == 0x455042:
-            val = 'bpe'
-        if val == 0x4C50:
-            val = 'pl'  
-        if val == 0x4C50:
-            val = 'vz'
-
-        self.data['signature'] = val
-
-    def __describe_pe_magic(self):
-        val = self.data['magic']
-        if val == 0x107:
-            val = 'rom'
-        if val == 0x10B:
-            val = 'pe32'
-        if val == '0x20B':
-            val = 'pe32+'
-
-        self.data['magic'] = val
+    except struct.error:
+        return None
 
 
-class PE_Directory_Debug(PE_Struct):
-    packinfo = [
-        ['I', 'characteristics'],
-        ['I', 'time_date_stamp'],
-        ['H', 'major_version'],
-        ['H', 'minor_version'],
-        ['I', 'type'],
-        ['I', 'size_of_data'],
-        ['I', 'address_of_raw_data'],
-        ['I', 'pointer_to_raw_data']
-    ]
-
-    def __init__(self, base, rva, size):
-        self.__base = base
-        super().__init__(PE_Directory_Debug.packinfo, ida_bytes.get_bytes(self.__base+rva, size))
-
-        self.__describe_type()
-
-    def __describe_type(self):
-        val = self.data['type']
-
-        if val == 0:
-            val = 'unknown'
-        elif val == 1:
-            val = 'coff'
-        elif val == 2:
-            val = 'codeview'
-        elif val == 3:
-            val = 'fpo'
-        elif val == 4:
-            val = 'misc'
-        elif val == 5:
-            val = 'exception'
-        elif val == 6:
-            val = 'fixup'
-        elif val == 7:
-            val = 'omap_to_src'
-        elif val == 8:
-            val = 'omap_from_src'
-        elif val == 9:
-            val = 'borland'
-        elif val == 10:
-            val = 'reserved'
-        elif val == 11:
-            val = 'clsid'
-        elif val == 12:
-            val = 'vc_feature'
-        elif val == 13:
-            val = 'pogo'
-        elif val == 14:
-            val = 'iltcg'
-        elif val == 15:
-            val = 'mpx'
-        elif val == 16:
-            val = 'repro'
-        elif val == 17:
-            val = 'ex_dllcharacteristics'
-
-        self.data['type'] = val
-
-    def get_section_size():
-        return struct.calcsize(PE_Struct.parse(PE_Directory_Debug.packinfo)[0])
-
-    def get_type(self):
-        return self.data['type']
-
-    def get_codeview(self):
-        if self.get_type() != 'codeview':
-            return None
-        
-        return PE_Directory_Debug_CodeView(self.__base, self.data['address_of_raw_data'], self.data['size_of_data'])
-
-
-class PE_Directory_Debug_CodeView(PE_Struct):
-    packinfo = [
-        ['I', 'magic'],
-        ['16s', 'guid'],
-        ['I', 'age'],
-    ]
-
-    def __init__(self, base, rva, size):
-        self.__base = base
-        super().__init__(PE_Directory_Debug_CodeView.packinfo, ida_bytes.get_bytes(self.__base + rva, size))
-
-    def get_section_size():
-        return struct.calcsize(PE_Struct.parse(PE_Directory_Debug_CodeView.packinfo)[0])
-
+def _read_pe_from_netnode():
+    '''Fallback when the input file is gone: IDA's cached "$ PE header" (header fields only).'''
+    node = ida_netnode.netnode('$ PE header')    # lookup only; upstream's create() wrote to the IDB
+    blob = node.valobj()
+    if not blob or len(blob) < 0x54:
+        return None
+    # peheader_t: signature(4) machine(2) nobjs(2) datetime(4) ... imagesize at 0x50
+    machine = struct.unpack_from('<H', blob, 4)[0]
+    datetime = struct.unpack_from('<I', blob, 8)[0]
+    image_size = struct.unpack_from('<I', blob, 0x50)[0]
+    return {
+        'image_datetime': datetime,
+        'image_machine': machine,
+        'image_size': image_size,
+        'pdb_age': 0,
+        'pdb_guid': [0] * 16,
+    }
 
 
 #
@@ -299,186 +142,111 @@ class PE_Directory_Debug_CodeView(PE_Struct):
 
 class DumpInfo():
     def __init__(self):
-        pass
+        self.warnings = []
 
     #
     # public
     #
 
-    def dump_info(self, filepath):
+    def dump_info(self, filepath, include_types=True):
+        '''
+        include_types=False skips the 'types'/'structs' sections. The native PDB/LIB generators
+        never read them, and on large databases they dominate the JSON size (upstream issue #52
+        reports a 178 MB dump), so PDB/LIB generation turns them off.
+        '''
+        self.warnings = []
         self._base = ida_nalt.get_imagebase()
 
         output = {
-            'general'   : self.__process_general(), 
-            'pe'        : self.__process_pe(),
-            'segments'  : self.__process_segments(),
-            'exports'   : self.__process_exports(),
-            'functions' : self.__process_functions(),
-            'names'     : self.__process_names(),
-            'types'     : self.__process_types(),
+            'general'   : self._process_general(),
+            'pe'        : self._process_pe(),
+            'segments'  : self._process_segments(),
+            'exports'   : self._process_exports(),
+            'functions' : self._process_functions(),
+            'names'     : self._process_names(),
         }
-        if ida_pro.IDA_SDK_VERSION < 900:
-            output['structs'] = self.__process_structs()
 
-        with open(filepath, "w") as f:
-            json.dump(output, f, indent=4)
+        if include_types:
+            output['types'] = self._process_types()
+            if ida_struct is not None:
+                output['structs'] = self._guard('structs', self._process_structs, [])
 
-  
+        nulls = self._strip_nulls(output)
+        if nulls:
+            self._warn('%d null value(s) replaced before writing JSON' % nulls)
+
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(output, f, indent=4, ensure_ascii=False)
+
+        return output
+
     #
-    # private/describe
+    # helpers
     #
 
-    def __describe_alignment(self, align):
+    def _warn(self, message):
+        self.warnings.append(message)
+
+    def _guard(self, what, fn, default):
+        try:
+            return fn()
+        except Exception as e:
+            self._warn('%s: skipped (%s: %s)' % (what, type(e).__name__, e))
+            return default
+
+    def _strip_nulls(self, node):
+        '''Last line of defence: the native tools abort on any JSON null (upstream #54/#55).'''
+        count = 0
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if value is None:
+                    node[key] = ''
+                    count += 1
+                else:
+                    count += self._strip_nulls(value)
+        elif isinstance(node, list):
+            for i, value in enumerate(node):
+                if value is None:
+                    node[i] = ''
+                    count += 1
+                else:
+                    count += self._strip_nulls(value)
+        return count
+
+    def _rva(self, ea, what):
+        rva = ea - self._base
+        if rva < 0 or rva >= RVA_LIMIT:
+            self._warn('%s at 0x%X is outside the 32-bit RVA range of the image, skipped' % (what, ea))
+            return None
+        return rva
+
+    #
+    # describers
+    #
+
+    def _describe_alignment(self, align):
         #https://hex-rays.com/products/ida/support/sdkdoc/group__sa__.html
-        if align == 0:
-            return 1
-        elif align == 1:
-            return 8
-        elif align == 2:
-            return 16
-        elif align == 3:
-            return 128
-        elif align == 4:
-            return 2048     
-        elif align == 5:
-            return 32 
-        elif align == 6:
-            return 32768
-        elif align == 7:
-            return 0
-        elif align == 8:
-            return 256
-        elif align == 9:
-            return 512
-        elif align == 10:
-            return 64
-        elif align == 11:
-            return 1024
-        elif align == 12:
-            return 4096
-        elif align == 13:
-            return 8192
-        elif align == 14:
-            return 16384
+        return {0: 1, 1: 8, 2: 16, 3: 128, 4: 2048, 5: 32, 6: 32768, 7: 0,
+                8: 256, 9: 512, 10: 64, 11: 1024, 12: 4096, 13: 8192, 14: 16384}.get(align, 0)
 
-        return 0
+    def _describe_bitness(self, bitness):
+        return {0: 16, 1: 32, 2: 64}.get(bitness, 0)
 
-    def __describe_bitness(self, bitness):
-        #https://hex-rays.com/products/ida/support/sdkdoc/classsegment__t.html#a7aa06d5fa4e0fc79e645d082eabf2a6a
-        if bitness == 0:
-            return 16
-        elif bitness == 1:
-            return 32
-        elif bitness == 2:
-            return 64
-
-        return 0
-
-    def __describe_permission(self, perm):
-        #https://hex-rays.com/products/ida/support/sdkdoc/group___s_e_g_p_e_r_m__.html
-
+    def _describe_permission(self, perm):
         result = ''
-        if perm & 4: 
+        if perm & 4:
             result += 'R'
-        if perm & 2: 
+        if perm & 2:
             result += 'W'
-        if perm & 1: 
+        if perm & 1:
             result += 'X'
-
         return result
 
-    def __describe_argloc(self, location):
-        #https://www.hex-rays.com/products/ida/support/sdkdoc/group___a_l_o_c__.html
-        if   location == 0:
-            return 'none'
-        elif location == 1:
-            return 'stack'
-        elif location == 2:
-            return 'distributed'
-        elif location == 3:
-            return 'register_one'
-        elif location == 4:
-            return 'register_pair'
-        elif location == 5:
-            return 'register_relative'
-        elif location == 6:
-            return 'global_address'
-        else:
-            return 'custom'
-        
-        return None
+    def _describe_argloc(self, location):
+        return {0: 'none', 1: 'stack', 2: 'distributed', 3: 'register_one', 4: 'register_pair',
+                5: 'register_relative', 6: 'global_address'}.get(location, 'custom')
 
-    def __describe_callingconvention(self, cm_cc):
-        #https://www.hex-rays.com/products/ida/support/sdkdoc/group___c_m___c_c__.html
-        cc = cm_cc & ida_typeinf.CM_CC_MASK
-        if cc == ida_typeinf.CM_CC_INVALID:
-            return 'invalid'
-        elif cc == ida_typeinf.CM_CC_UNKNOWN:
-            return 'unknown'
-        elif cc == ida_typeinf.CM_CC_VOIDARG:
-            return 'voidarg'
-        elif cc == ida_typeinf.CM_CC_CDECL:
-            return 'cdecl'
-        elif cc == ida_typeinf.CM_CC_ELLIPSIS:
-            return 'cdecl_ellipsis'
-        elif cc == ida_typeinf.CM_CC_STDCALL:
-            return 'stdcall'
-        elif cc == ida_typeinf.CM_CC_PASCAL:
-            return 'pascal'
-        elif cc == ida_typeinf.CM_CC_FASTCALL:
-            return 'fastcall'
-        elif cc == ida_typeinf.CM_CC_THISCALL:
-            return 'thiscall'
-        elif cc == ida_typeinf.CM_CC_SPOILED:
-            return 'spoiled'
-        elif cc == 0xB0:
-            return 'reserved'
-        elif cc == ida_typeinf.CM_CC_RESERVE3:
-            return 'reserved'
-        elif cc == ida_typeinf.CM_CC_SPECIALE:
-            return 'special_ellipsis'
-        elif cc == ida_typeinf.CM_CC_SPECIALP:
-            return 'special_pstack'
-        elif cc == ida_typeinf.CM_CC_SPECIAL:
-            return 'special'
-
-        if ida_pro.IDA_SDK_VERSION < 900:
-            if cc == ida_typeinf.CM_CC_MANUAL:
-                return 'manual'
-
-        return 'unknown_%s' % cc
-
-    def __describe_memorymodel_code(self, cm_cc):
-        #https://hex-rays.com/products/ida/support/sdkdoc/group___c_m___m__.html
-        cm = cm_cc & ida_typeinf.CM_M_MASK
-        
-        if cm == ida_typeinf.CM_M_NN:
-            return 'near'
-        elif cm == ida_typeinf.CM_M_FF:
-            return 'far'
-        elif cm == ida_typeinf.CM_M_NF:
-            return 'near'
-        elif cm == ida_typeinf.CM_M_FN:
-            return 'far'
-        
-        return 'unknown_%s' % cm_cc
-
-    def __describe_memorymodel_data(self, cm_cc):
-        #https://hex-rays.com/products/ida/support/sdkdoc/group___c_m___m__.html
-        cm = cm_cc & ida_typeinf.CM_M_MASK
-        
-        if cm == ida_typeinf.CM_M_NN:
-            return 'near'
-        elif cm == ida_typeinf.CM_M_FF:
-            return 'far'
-        elif cm == ida_typeinf.CM_M_NF:
-            return 'far'
-        elif cm == ida_typeinf.CM_M_FN:
-            return 'near'
-        
-        return 'unknown_%s' % cm_cc
-
-    def __describe_struct_type(self, st_props):
+    def _describe_struct_type(self, st_props):
         #https://hex-rays.com/products/ida/support/sdkdoc/group___s_f__.html
 
         result = ''
@@ -498,7 +266,7 @@ class DumpInfo():
 
         return result
 
-    def __describe_type_basetype(self, type):
+    def _describe_type_basetype(self, type):
         #https://hex-rays.com/products/ida/support/sdkdoc/group__tf.html
 
         type_base = type & ida_typeinf.TYPE_BASE_MASK
@@ -657,380 +425,297 @@ class DumpInfo():
         return 'unknown_%s_%s_%s' % (hex(type_base), hex(type_flags), hex(type_modif))
 
     #
-    # private/get
+    # type info (best effort -- never allowed to abort the export)
     #
 
-    def __get_type_data(self, ea):
+    def _get_type_data(self, ea):
         tinfo = ida_typeinf.tinfo_t()
-        ida_nalt.get_tinfo(tinfo, ea)
         func_type_data = ida_typeinf.func_type_data_t()
-        tinfo.get_func_details(func_type_data)
-        
+        if ida_nalt.get_tinfo(tinfo, ea):
+            tinfo.get_func_details(func_type_data)
         return func_type_data
 
+    def _process_function_typeinfo(self, info, ea):
+        info['calling_convention'] = 'unknown'
+        info['memory_model_code'] = 'unknown'
+        info['memory_model_data'] = 'unknown'
+        info['return_type'] = ''
+        info['arguments'] = []
+        try:
+            ftd = self._get_type_data(ea)
+            cc = compat.func_cc(ftd)
+            info['calling_convention'] = compat.describe_cc(cc)
+            info['memory_model_code'] = compat.describe_memory_model(cc, True)
+            info['memory_model_data'] = compat.describe_memory_model(cc, False)
+            info['return_type'] = compat.tinfo_to_str(ftd.rettype)
+
+            arguments = []
+            for funcarg in ftd:
+                arguments.append({
+                    'name'              : compat.safe_str(funcarg.name),
+                    'type'              : compat.tinfo_to_str(funcarg.type),
+                    'argument_location' : self._describe_argloc(funcarg.argloc.atype()),
+                })
+            info['arguments'] = arguments
+        except Exception as e:
+            self._typeinfo_failures += 1
+            if self._typeinfo_failures <= 5:
+                self._warn('type info for 0x%X skipped (%s: %s)' % (ea, type(e).__name__, e))
 
     #
-    # private/process
+    # sections
     #
 
-    def __process_general(self):
-        info_struct = None
-        if ida_pro.IDA_SDK_VERSION < 900:
-            info_struct = ida_idaapi.get_inf_structure()
-
-        #architecture
-        arch = None
-        if ida_pro.IDA_SDK_VERSION >= 900:
-            arch = ida_ida.inf_get_procname()
-        else:
-            arch = info_struct.procname
-
+    def _process_general(self):
+        arch = compat.procname()
         if arch == 'metapc':
             arch = 'x86'
         elif arch == 'ARM':
             arch = 'arm'
 
-        #bitness
-        bitness = 0
-        if ida_pro.IDA_SDK_VERSION >= 900:
-            if ida_ida.inf_is_64bit():
-                bitness = 64
-            elif ida_ida.inf_is_16bit():
-                bitness = 16
-            else:
-                bitness = 32
-        else:
-            if info_struct.is_64bit():
-                bitness = 64
-            elif info_struct.is_32bit():
-                bitness = 32
-            else:
-                bitness = 16
-
-        result = {
-            'filename'    : ida_nalt.get_root_filename(),
+        return {
+            'filename'    : compat.safe_str(ida_nalt.get_root_filename()),
             'architecture': arch,
-            'bitness'     : bitness
+            'bitness'     : compat.bitness(),
         }
 
-        return result
+    def _process_pe(self):
+        info = _read_pe_from_file(ida_nalt.get_input_file_path())
+        if info is None:
+            info = _read_pe_from_netnode()
+            if info is not None:
+                self._warn('input file not found on disk; PE header taken from the IDB, '
+                           'CodeView GUID unavailable')
+        if info is None:
+            self._warn('no PE header information available')
+            info = {'image_datetime': 0, 'image_machine': 0, 'image_size': 0,
+                    'pdb_age': 0, 'pdb_guid': [0] * 16}
 
-    def __process_segments(self):
-        segments = list()
+        info['image_base'] = self._base
+        return info
 
-        for n in range(0, ida_segment.get_segm_qty()):
+    def _process_segments(self):
+        segments = []
+        for n in range(ida_segment.get_segm_qty()):
             seg = ida_segment.getnseg(n)
-            if seg:
-                segm = {
-                    'align'     : self.__describe_alignment(seg.align),
-                    'bitness'   : self.__describe_bitness(seg.bitness),
-                    'name'      : ida_segment.get_segm_name(seg),
-                    'rva_start' : seg.start_ea - self._base,
-                    'rva_end'   : seg.end_ea - self._base,
-                    'permission': self.__describe_permission(seg.perm),
-                    'selector'  : seg.sel,
-                    'type'      : ida_segment.get_segm_class(seg),
-                }
-                
-                segments.append(segm)
+            if not seg:
+                continue
 
+            start = self._rva(seg.start_ea, 'segment')
+            end = self._rva(seg.end_ea - 1, 'segment end')
+            if start is None or end is None:
+                continue
+
+            segments.append({
+                'align'     : self._describe_alignment(seg.align),
+                'bitness'   : self._describe_bitness(seg.bitness),
+                'name'      : compat.safe_str(ida_segment.get_segm_name(seg), 'seg%d' % n),
+                'rva_start' : start,
+                'rva_end'   : end + 1,
+                'permission': self._describe_permission(seg.perm),
+                'selector'  : seg.sel,
+                # None on 9.x for segments IDA could not classify (upstream issue #54)
+                'type'      : compat.safe_str(ida_segment.get_segm_class(seg), 'UNKNOWN'),
+            })
         return segments
 
-    def __process_function_typeinfo(self, info, func):
-
-        func_type_data = self.__get_type_data(func.start_ea)
-
-        #calling convention
-        info['calling_convention'] = self.__describe_callingconvention(func_type_data.cc)
-        info['memory_model_code']  = self.__describe_memorymodel_code(func_type_data.cc)
-        info['memory_model_data']  = self.__describe_memorymodel_data(func_type_data.cc)
-
-        #return type
-        info['return_type'] = ida_typeinf.print_tinfo('', 0, 0, ida_typeinf.PRTYPE_1LINE, func_type_data.rettype, '', '')
-
-        #arguments
-        arguments = list()
-        
-        for funcarg in func_type_data:
-            arginfo = {
-                'name'              : funcarg.name,
-                'type'              : ida_typeinf.print_tinfo('', 0, 0, ida_typeinf.PRTYPE_1LINE, funcarg.type, '', ''),
-                'argument_location' : self.__describe_argloc(funcarg.argloc.atype())
-            }
-            
-            arguments.append(arginfo)
-
-        info['arguments'] = arguments
-
-    def __process_function_labels(self, func):
-        labels = list()
-
+    def _process_function_labels(self, func):
+        labels = []
         it = ida_funcs.func_item_iterator_t()
         if not it.set(func):
             return labels
 
         while it.next_code():
             ea = it.current()
-            name = ida_name.get_visible_name(ea, ida_name.GN_LOCAL)
-
-            if name != '':
+            name = compat.safe_str(ida_name.get_visible_name(ea, ida_name.GN_LOCAL))
+            if name:
                 labels.append({
                     'offset'       : ea - func.start_ea,
                     'name'         : name,
-                    'is_public'    : ida_name.is_public_name(ea),
-                    'is_autonamed' : ida_bytes.get_full_flags(ea) & ida_bytes.FF_LABL != 0
+                    'is_public'    : bool(ida_name.is_public_name(ea)),
+                    'is_autonamed' : ida_bytes.get_full_flags(ea) & ida_bytes.FF_LABL != 0,
                 })
-
         return labels
 
-    def __process_functions(self):
-        functions = list()
+    def _process_functions(self):
+        functions = []
+        self._typeinfo_failures = 0
+        lo, hi = compat.min_ea(), compat.max_ea()
 
-        # find EA
-        start = 0
-        end = 0
-        if ida_pro.IDA_SDK_VERSION >= 900:
-            start = ida_ida.inf_get_min_ea()
-            end = ida_ida.inf_get_max_ea()
-        else:
-            start = ida_ida.cvar.inf.min_ea
-            end   = ida_ida.cvar.inf.max_ea
+        # getn_func() walks function *entries* only (never tail chunks), which replaces
+        # upstream's hand-rolled fchunk traversal.
+        for i in range(ida_funcs.get_func_qty()):
+            func = ida_funcs.getn_func(i)
+            if func is None or not (lo <= func.start_ea < hi):
+                continue
 
-        # find first function head chunk in the range
-        chunk = ida_funcs.get_fchunk(start)
-        
-        if not chunk:
-            chunk = ida_funcs.get_next_fchunk(start)
-        while chunk and chunk.start_ea < end and (chunk.flags & ida_funcs.FUNC_TAIL) != 0:
-            chunk = ida_funcs.get_next_fchunk(chunk.start_ea)
-        
-        func = chunk
-
-        while func and func.start_ea < end:
-            start_ea = func.start_ea
-            
-            func_flags = ida_bytes.get_full_flags(start_ea)
-            func_name = ida_funcs.get_func_name(start_ea)
-            func_name_demangled = ida_name.get_demangled_name(start_ea, 0xFFFF, 0, 0)
-            func_autonamed = func_flags & ida_bytes.FF_LABL != 0
-            func_public = ida_name.is_public_name(start_ea)
+            ea = func.start_ea
+            rva = self._rva(ea, 'function')
+            if rva is None:
+                continue
 
             function = {
-                'start_rva'     : start_ea - self._base,
-                'name'          : func_name,
-                'name_demangled': func_name_demangled,
-                'is_public'     : func_public,
-                'is_autonamed'  : func_autonamed
+                'start_rva'     : rva,
+                'name'          : compat.func_name(ea),
+                'name_demangled': compat.demangled_name(ea),
+                'is_public'     : bool(ida_name.is_public_name(ea)),
+                'is_autonamed'  : ida_bytes.get_full_flags(ea) & ida_bytes.FF_LABL != 0,
             }
-
-            # PE32/PE32+ only support binaries up to 2GB
-            if function['start_rva'] >= 2**32:
-                print('RVA out of range for function: ' + function['name'], file=sys.stderr)
-
-            self.__process_function_typeinfo(function, func)
-
-            function['labels'] = self.__process_function_labels(func)
-
+            self._process_function_typeinfo(function, ea)
+            function['labels'] = self._process_function_labels(func)
             functions.append(function)
 
-            func = ida_funcs.get_next_func(start_ea)
-
+        if self._typeinfo_failures > 5:
+            self._warn('type info skipped for %d functions in total' % self._typeinfo_failures)
         return functions
 
-    def __process_names(self):
-        names = list()
-
-        for i in range(0, ida_name.get_nlist_size()):
+    def _process_names(self):
+        names = []
+        for i in range(ida_name.get_nlist_size()):
             ea = ida_name.get_nlist_ea(i)
+            name = compat.safe_str(ida_name.get_nlist_name(i))
+            if not name:
+                continue
+
+            # functions are emitted from _process_functions; labels inside functions only
+            # with the "(with function labels)" command
             if ida_funcs.get_func(ea) is not None:
                 continue
 
-            if ida_name.get_nlist_name(i) is None:
+            # the native generator maps every symbol onto a segment by RVA
+            if ida_segment.getseg(ea) is None:
                 continue
 
-            name = {
-                'rva'            : ea - self._base,
-                'name'           : ida_name.get_nlist_name(i),
-                'name_demangled' : ida_name.get_demangled_name(ea, 0xFFFF, 0, 0),
-                'is_public'      : ida_name.is_public_name(ea),
-                'is_func'        : ida_funcs.get_func(ea) is not None
-            }
+            rva = self._rva(ea, 'name "%s"' % name)
+            if rva is None:
+                continue
 
-            # PE32/PE32+ only support binaries up to 2GB
-            if name['rva'] >= 2**32:
-                print('RVA out of range for name: ' + name['name'], file=sys.stderr)
-
-            names.append(name)
-
+            names.append({
+                'rva'            : rva,
+                'name'           : name,
+                'name_demangled' : compat.demangled_name(ea),
+                'is_public'      : bool(ida_name.is_public_name(ea)),
+                'is_func'        : False,
+            })
         return names
 
-    def __process_exports(self):
-        exports = list()
-
-        for i in range(0, ida_entry.get_entry_qty()):
+    def _process_exports(self):
+        exports = []
+        for i in range(ida_entry.get_entry_qty()):
             ordinal = ida_entry.get_entry_ordinal(i)
-
             ea = ida_entry.get_entry(ordinal)
+            rva = self._rva(ea, 'export #%d' % ordinal)
+            if rva is None:
+                continue
 
             flags = ida_bytes.get_full_flags(ea)
-            type_data = self.__get_type_data(ea)
-            type = 'unknown'
+            export_type = 'unknown'
             if ida_bytes.is_func(flags):
-                type = 'function'
+                export_type = 'function'
             elif ida_bytes.is_data(flags):
-                type = 'data'
+                export_type = 'data'
 
-            export = {
+            cc = 'unknown'
+            try:
+                cc = compat.describe_cc(compat.func_cc(self._get_type_data(ea)))
+            except Exception:
+                pass
+
+            exports.append({
                 'ordinal'           : ordinal,
-                'rva'               : ea - self._base,
-                'name'              : ida_entry.get_entry_name(ordinal),
-                'type'              : type,
-                'calling_convention': self.__describe_callingconvention(type_data.cc)
-            }
-
-            exports.append(export)
-
+                'rva'               : rva,
+                'name'              : compat.safe_str(ida_entry.get_entry_name(ordinal),
+                                                      'ordinal_%d' % ordinal),
+                'type'              : export_type,
+                'calling_convention': cc,
+            })
         return exports
 
-    def __process_pe(self):
-        result = {}
+    #
+    # local types (not consumed by the native tools; exported for other consumers)
+    #
 
-        peheader = PE_Header_IDA()
+    def _process_types_udt_member(self, udt_member):
+        typename = compat.safe_str(udt_member.type.get_type_name())
+        if not typename:
+            typename = compat.tinfo_to_str(udt_member.type) or \
+                       self._describe_type_basetype(udt_member.type.get_realtype())
+        return {
+            'name'   : compat.safe_str(udt_member.name),
+            'offset' : udt_member.offset // 8,
+            'size'   : udt_member.size // 8,
+            'type'   : typename,
+        }
 
-        #peheader
-        result['image_datetime'] = peheader.data['datetime']
-        result['image_machine'] = peheader.data['machine']
-        result['image_size'] = peheader.data['imagesize']
-        result['image_base'] = peheader.get_imagebase()
-
-        #debug
-        result['pdb_age'] = 0
-        result['pdb_guid'] = [0] * 16
-
-        peheader_debug = peheader.get_sections_debug()
-        if peheader_debug is not None:
-            for section in peheader_debug:
-                if section.get_type() != 'codeview':
-                    continue
-
-                pe_codeview = section.get_codeview()
-                if pe_codeview is not None:
-                    result['pdb_age'] = pe_codeview.data['age']
-                    result['pdb_guid'] = list(pe_codeview.data['guid'])
-
-        return result
-
-    def __process_struct_members(self, st_obj):
-        
-        members = []
-        for st_member in st_obj.members:
-            mem_name = ida_struct.get_member_name(st_member.id) or ('unknown_%s' % st_member.id)
-            
-            mem_off_start = 0 if st_obj.is_union() else st_member.soff
-            mem_off_end   = st_member.eoff
-
-            mem_tinfo = ida_typeinf.tinfo_t()
-            ida_struct.get_member_tinfo(mem_tinfo, st_member)
-            
-            mem_typename = ida_typeinf.print_tinfo('', 0, 0, ida_typeinf.PRTYPE_1LINE, mem_tinfo, '', '')
-            if not mem_typename:
-                mem_typename = self.__describe_type_basetype(mem_tinfo.get_realtype())
-
-            members.append({
-                'offset' : mem_off_start,
-                'length' : mem_off_end - mem_off_start,
-                'type'   : mem_typename,
-                'name'   : mem_name,
-            })
-        
-        return members
-
-    def __process_structs(self):
-        structs = []
-
-        st_idx  = ida_struct.get_first_struc_idx()
-        while st_idx != ida_idaapi.BADADDR:
-
-            st_id = ida_struct.get_struc_by_idx(st_idx)
-            st_obj = ida_struct.get_struc(st_id)
-
-            st_name = ida_struct.get_struc_name(st_id)
-                    
-            structs.append({
-                'type'            : self.__describe_struct_type(st_obj.props),
-                'name'            : st_name,
-                'size'            : int(ida_struct.get_struc_size(st_obj)), 
-                'members'         : self.__process_struct_members(st_obj)
-            })
-
-            st_idx = ida_struct.get_next_struc_idx(st_idx)
-           
-        return structs
-
-    def __process_types_enum_member(self, enum_member : ida_typeinf.enum_member_t):
-        result = {}
-        
-        result['name'] = enum_member.name
-        result['value'] = enum_member.value
-
-        return result
-
-    def __process_types_udt_member(self, udt_member : ida_typeinf.udt_member_t):
-        result = {}
-        
-        result['name'] = udt_member.name
-        result['offset'] = udt_member.offset // 8
-        result['size'] = udt_member.size // 8
-
-        udt_mem_type = udt_member.type
-        udt_mem_typename = udt_member.type.get_type_name()
-        if not udt_mem_typename:
-            udt_mem_typename = self.__describe_type_basetype(udt_mem_type.get_realtype())
-        result['type'] = udt_mem_typename
-
-        return result
-
-    def __process_types_tinfo(self, ti_info : ida_typeinf.tinfo_t):
-        localtype = {}
-        
-        localtype['name'] = ti_info.get_type_name()
-        localtype['basetype'] = self.__describe_type_basetype(ti_info.get_realtype())
-        localtype['size'] = ti_info.get_size()
+    def _process_types_tinfo(self, ti_info):
+        localtype = {
+            'name'     : compat.safe_str(ti_info.get_type_name()),
+            'basetype' : self._describe_type_basetype(ti_info.get_realtype()),
+            'size'     : ti_info.get_size(),
+        }
         if localtype['size'] == ida_idaapi.BADADDR:
             localtype['size'] = 0
 
         ti_udt = ida_typeinf.udt_type_data_t()
         ti_enum = ida_typeinf.enum_type_data_t()
-
         if ti_info.get_udt_details(ti_udt):
-            members = []
-            for member in ti_udt:
-                members.append(self.__process_types_udt_member(member))
-
-            localtype['members'] = members
+            localtype['members'] = [self._process_types_udt_member(m) for m in ti_udt]
         elif ti_info.get_enum_details(ti_enum):
-            members = []
-            for member in ti_enum:
-                members.append(self.__process_types_enum_member(member))
-
-            localtype['members'] = members
-
+            localtype['members'] = [{'name': compat.safe_str(m.name), 'value': m.value}
+                                    for m in ti_enum]
         return localtype
 
-    def __process_types(self):
+    def _process_types(self):
         localtypes = []
-
-        ti_lib_obj = ida_typeinf.get_idati()
-
-        ti_lib_count = 0
-        if ida_pro.IDA_SDK_VERSION >= 900:
-            ida_typeinf.get_ordinal_count(ti_lib_obj)
-        else:
-            ti_lib_count = ida_typeinf.get_ordinal_qty(ti_lib_obj)
-
-        for ti_ordinal in range(1, ti_lib_count + 1):
+        til = ida_typeinf.get_idati()
+        failures = 0
+        for ordinal in range(1, compat.local_type_count(til) + 1):
             ti_info = ida_typeinf.tinfo_t()
-            if ti_info.get_numbered_type(ti_lib_obj, ti_ordinal):
-                localtypes.append(self.__process_types_tinfo(ti_info))
-
+            try:
+                if ti_info.get_numbered_type(til, ordinal):
+                    localtypes.append(self._process_types_tinfo(ti_info))
+            except Exception as e:
+                failures += 1
+                if failures <= 5:
+                    self._warn('local type #%d skipped (%s: %s)' % (ordinal, type(e).__name__, e))
+        if failures > 5:
+            self._warn('%d local types skipped in total' % failures)
         return localtypes
+
+    #
+    # IDA < 9.0 only: legacy ida_struct structures
+    #
+
+    def _process_struct_members(self, st_obj):
+        members = []
+        for st_member in st_obj.members:
+            mem_name = compat.safe_str(ida_struct.get_member_name(st_member.id)) or \
+                       ('unknown_%s' % st_member.id)
+            mem_off_start = 0 if st_obj.is_union() else st_member.soff
+            mem_tinfo = ida_typeinf.tinfo_t()
+            ida_struct.get_member_tinfo(mem_tinfo, st_member)
+            mem_typename = compat.tinfo_to_str(mem_tinfo) or \
+                           self._describe_type_basetype(mem_tinfo.get_realtype())
+            members.append({
+                'offset' : mem_off_start,
+                'length' : st_member.eoff - mem_off_start,
+                'type'   : mem_typename,
+                'name'   : mem_name,
+            })
+        return members
+
+    def _process_structs(self):
+        structs = []
+        st_idx = ida_struct.get_first_struc_idx()
+        while st_idx != ida_idaapi.BADADDR:
+            st_id = ida_struct.get_struc_by_idx(st_idx)
+            st_obj = ida_struct.get_struc(st_id)
+            structs.append({
+                'type'    : self._describe_struct_type(st_obj.props),
+                'name'    : compat.safe_str(ida_struct.get_struc_name(st_id)),
+                'size'    : int(ida_struct.get_struc_size(st_obj)),
+                'members' : self._process_struct_members(st_obj),
+            })
+            st_idx = ida_struct.get_next_struc_idx(st_idx)
+        return structs
+
