@@ -1,3 +1,6 @@
+#include <exception>
+#include <iostream>
+
 #include "commands/command_executor.h"
 
 namespace FakePDB{
@@ -27,7 +30,15 @@ namespace FakePDB{
             }
 
             //run
-            return command->Run(argc, argv);
+            try {
+                return command->Run(argc, argv);
+            }
+            catch (const std::exception& e) {
+                // Previously an uncaught exception here aborted the process
+                // (0xC0000409 on Windows) with no output at all.
+                std::cerr << "error: " << e.what() << std::endl;
+                return 2;
+            }
         }
 
         std::cerr << "Command not found" << std::endl;

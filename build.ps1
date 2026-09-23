@@ -124,15 +124,19 @@ function Sign-Folder($Folder, $Filters = @("*.exe", "*.dll"), $TimestampServer =
 # Build functions
 #
 
+# Pinned. Upstream cloned llvm-project main at HEAD, so whether FakePDB compiled depended on
+# the day you built it. The FakePDB sources are verified to build against the 18.1.x line.
+$llvm_tag = "llvmorg-18.1.8"
+
 function Build-LLVM(){
     if (Test-Path -Path "./~build/llvm_git"){
         Push-Location "./~build/llvm_git"
-        git reset --hard
-        git pull
+        git fetch --depth=1 origin tag $llvm_tag
+        git reset --hard $llvm_tag
         Pop-Location
     }
     else{
-        git clone --depth=1 https://github.com/llvm/llvm-project "./~build/llvm_git"
+        git clone --depth=1 --branch $llvm_tag https://github.com/llvm/llvm-project "./~build/llvm_git"
     }
 
     cmake "./~build/llvm_git/llvm" `

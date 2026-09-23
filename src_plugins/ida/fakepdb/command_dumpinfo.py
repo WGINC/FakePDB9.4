@@ -16,49 +16,42 @@
 
 import os
 
-import ida_auto
 import ida_kernwin
-import ida_nalt
-import ida_loader
 
+from . import ui
 from .dumpinfo import DumpInfo
 
-class __fakepdb_dumpinfo_actionhandler(ida_kernwin.action_handler_t):
+
+class _DumpInfoHandler(ida_kernwin.action_handler_t):
     def __init__(self):
         ida_kernwin.action_handler_t.__init__(self)
 
-    # Say hello when invoked.
     def activate(self, ctx):
-        # get active filename
-        pe_filename_ext = ida_nalt.get_root_filename()
-        if not pe_filename_ext:
+        name_ext, _ = ui.input_names()
+        if not name_ext:
             print('FakePDB/dumpinfo: file not loaded')
             return 1
 
-        #calculate locations
-        idb_dir = os.path.dirname(ida_loader.get_path(ida_loader.PATH_TYPE_IDB))
-
-        filepath_json = os.path.join(idb_dir, pe_filename_ext + ".json")
-
-        dumper = DumpInfo()
+        filepath_json = os.path.join(ui.idb_dir(), name_ext + '.json')
         print('FakePDB/dumpinfo:')
-        ida_auto.set_ida_state(ida_auto.st_Work)
-        dumper.dump_info(filepath_json)
-        ida_auto.set_ida_state(ida_auto.st_Ready)
-        print('   * done')
+        dumper = DumpInfo()
+        try:
+            with ui.busy():
+                output = dumper.dump_info(filepath_json, include_types=True)
+        except Exception as e:
+            print('    * FAILED: %s: %s' % (type(e).__name__, e))
+            return 1
+
+        ui.print_warnings(dumper)
+        print('    * %d functions, %d names, %d segments, %d local types'
+              % (len(output['functions']), len(output['names']),
+                 len(output['segments']), len(output.get('types', []))))
+        print('    * written: %s' % filepath_json)
         return 1
 
     def update(self, ctx):
         return ida_kernwin.AST_ENABLE_FOR_IDB
-    
-def register_actions():
-    action_desc = ida_kernwin.action_desc_t(
-        'fakepdb_dumpinfo',                 # The action name. This acts like an ID and must be unique
-        'Dump info to .json',               # The action text.
-        __fakepdb_dumpinfo_actionhandler(), # The action handler.
-        'Ctrl+Shift+1',                     # Optional: the action shortcut
-        '',                                 # Optional: the action tooltip (available in menus/toolbar)
-        0)                                  # Optional: the action icon (shows when in menus/toolbars)
 
-    ida_kernwin.register_action(action_desc)
-    ida_kernwin.attach_action_to_menu('Edit/FakePDB/', 'fakepdb_dumpinfo', ida_kernwin.SETMENU_APP)
+
+def register_actions():
+    ui.register('fakepdb_dumpinfo', 'Dump info to .json', _DumpInfoHandler(), 'Ctrl+Shift+1')

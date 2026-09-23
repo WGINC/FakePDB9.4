@@ -21,6 +21,10 @@
 #include "nlohmann/json.hpp"
 
 //fakepdb
+#include <functional>
+#include <iostream>
+#include <stdexcept>
+
 #include "db.h"
 
 namespace FakePDB::Data {
@@ -59,11 +63,33 @@ namespace FakePDB::Data {
     void DB::load(std::filesystem::path &filepath) {
         std::ifstream istream(filepath);
         if (!istream.is_open()) {
-            return;
+            throw std::runtime_error("cannot open JSON file: " + filepath.string());
         }
 
         nlohmann::json json;
         istream >> json;
+
+        // IDA 9.x's Python API returns None in several places where 7.x returned "" (segment
+        // class, names of functions IDA never displayed, ...). nlohmann's strict std::string
+        // conversion throws on JSON null, which used to abort the whole run with no message.
+        // Replace nulls with "" and report how many were found, rather than failing silently.
+        size_t nulls_fixed = 0;
+        std::function<void(nlohmann::json&)> sanitize = [&](nlohmann::json& node) {
+            if (node.is_null()) {
+                node = "";
+                nulls_fixed++;
+            } else if (node.is_structured()) {
+                for (auto& child : node) {
+                    sanitize(child);
+                }
+            }
+        };
+        sanitize(json);
+        if (nulls_fixed != 0) {
+            std::cerr << "warning: replaced " << nulls_fixed
+                      << " null value(s) in the JSON with empty strings" << std::endl;
+        }
+
         _root = json.get<Root>();
 
         //Labels
